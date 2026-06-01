@@ -1,0 +1,27 @@
+# Excluir el __init__.py raíz para que el WORKDIR /app no sea un paquete Python
+__init__.py
+
+# Tests y herramientas de desarrollo
+tests/
+.pytest_cache/
+__pycache__/
+*.pyc
+*.pyo
+.env
+.env.*
+!.env.example
+
+# Archivos de draft/borrador del root
+*_draft.py
+strangler.py
+health.py
+correlation.py
+resilience.py
+problem.py
+run.py
+
+# Docs
+*.md
+plan.md
+spec.md
+tasks.md

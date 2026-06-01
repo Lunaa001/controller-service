@@ -1,0 +1,123 @@
+version: '3.9'
+
+services:
+  # Redis para caché
+  redis:
+    image: redis:7-alpine
+    container_name: notebookum-redis
+    ports:
+      - "6379:6379"
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-notebookum_redis_pass}
+    command: redis-server --requirepass ${REDIS_PASSWORD:-notebookum_redis_pass}
+    volumes:
+      - redis-data:/data
+    networks:
+      - notebookum-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Controller (Go)
+  controller:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: notebookum-controller
+    ports:
+      - "5000:5000"
+    environment:
+      PORT: "5000"
+      X_CORRELATION_HEADER: "X-Correlation-ID"
+      X_USER_ID_HEADER: "X-User-ID"
+      USER_SERVICE_URL: ${USER_SERVICE_URL:-http://user-service:8001}
+      EXTRACT_SERVICE_URL: ${EXTRACT_SERVICE_URL:-http://extract-service:8002}
+      SUMMARY_SERVICE_URL: ${SUMMARY_SERVICE_URL:-http://summary-service:8003}
+      PERSISTENCE_URL: ${PERSISTENCE_URL:-http://persistence-service:8004}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-notebookum_redis_pass}
+      REQUEST_TIMEOUT: "30"
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - notebookum-network
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:5000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Placeholders para los otros servicios (para fines de documentación)
+  # En producción, estos estarían en repositorios separados
+
+  # User Service (Python) - a ser desarrollado por otro equipo
+  # user-service:
+  #   build: ../user-service
+  #   container_name: notebookum-user-service
+  #   ports:
+  #     - "8001:8001"
+  #   environment:
+  #     PORT: "8001"
+  #   networks:
+  #     - notebookum-network
+
+  # Extract Service (Python) - a ser desarrollado por otro equipo
+  # extract-service:
+  #   build: ../extract-service
+  #   container_name: notebookum-extract-service
+  #   ports:
+  #     - "8002:8002"
+  #   environment:
+  #     PORT: "8002"
+  #   networks:
+  #     - notebookum-network
+
+  # Summary Service (Python) - a ser desarrollado por otro equipo
+  # summary-service:
+  #   build: ../summary-service
+  #   container_name: notebookum-summary-service
+  #   ports:
+  #     - "8003:8003"
+  #   environment:
+  #     PORT: "8003"
+  #   networks:
+  #     - notebookum-network
+
+  # Persistence Service (Java) - a ser desarrollado por otro equipo
+  # persistence-service:
+  #   build: ../persistence-service
+  #   container_name: notebookum-persistence-service
+  #   ports:
+  #     - "8004:8004"
+  #   environment:
+  #     PORT: "8004"
+  #     DATABASE_URL: "jdbc:postgresql://postgres:5432/notebookum"
+  #   depends_on:
+  #     - postgres
+  #   networks:
+  #     - notebookum-network
+
+  # Database (PostgreSQL)
+  # postgres:
+  #   image: postgres:16-alpine
+  #   container_name: notebookum-postgres
+  #   ports:
+  #     - "5432:5432"
+  #   environment:
+  #     POSTGRES_USER: ${POSTGRES_USER:-notebookum}
+  #     POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-notebookum_pass}
+  #     POSTGRES_DB: notebookum
+  #   volumes:
+  #     - postgres-data:/var/lib/postgresql/data
+  #   networks:
+  #     - notebookum-network
+
+volumes:
+  redis-data:
+
+networks:
+  notebookum-network:
+    driver: bridge

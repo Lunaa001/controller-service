@@ -1,0 +1,689 @@
+openapi: "3.1.0"
+
+info:
+  title: Service-Controller-NotebookUm API
+  version: "1.0"
+  description: >
+    Punto de entrada HTTP público del ecosistema NotebookUm.
+    Implementa el patrón Strangler, validación en borde, Circuit Breaker,
+    Bulkhead, Rate Limiting y Saga Orchestrator para el flujo de upload.
+  contact:
+    name: Equipo NotebookUm
+
+servers:
+  - url: http://controller.universidad.localhost/api/v1
+    description: Desarrollo local (Traefik)
+
+# ─────────────────────────────────────────
+# Schemas reutilizables
+# ─────────────────────────────────────────
+components:
+  schemas:
+
+    ProblemDetail:
+      description: RFC 9457 — Problem Details for HTTP APIs
+      type: object
+      required: [type, title, status, detail, instance]
+      properties:
+        type:
+          type: string
+          format: uri
+          example: "https://notebookum.example/errors/file-too-large"
+        title:
+          type: string
+          example: "File Too Large"
+        status:
+          type: integer
+          example: 400
+        detail:
+          type: string
+          example: "The uploaded file exceeds the maximum size of 25MB."
+        instance:
+          type: string
+          example: "/api/v1/documento/upload?requestId=abc123"
+
+    CircuitBreakerEntry:
+      type: object
+      required: [service, state, failureCount]
+      properties:
+        service:
+          type: string
+          example: "service-user"
+        state:
+          type: string
+          enum: [closed, open, half-open]
+          example: "closed"
+        failureCount:
+          type: integer
+          minimum: 0
+          example: 0
+
+    UpstreamStatus:
+      type: object
+      additionalProperties:
+        type: string
+        enum: [ok, unreachable, timeout]
+      example:
+        service-user: "ok"
+        service-persistence: "ok"
+        service-extractor: "ok"
+        service-ai: "ok"
+        monolito: "ok"
+
+    UserCreateRequest:
+      type: object
+      required: [name, email]
+      properties:
+        name:
+          type: string
+          example: "Jane Doe"
+        email:
+          type: string
+          format: email
+          example: "jane@example.com"
+
+    UserResponse:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        email:
+          type: string
+          format: email
+        created_at:
+          type: string
+          format: date-time
+
+    DocumentUploadResponse:
+      type: object
+      properties:
+        document_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [accepted]
+        message:
+          type: string
+          example: "Document upload initiated, processing in progress"
+
+    SummaryResponse:
+      type: object
+      properties:
+        document_id:
+          type: string
+          format: uuid
+        summary:
+          type: string
+        status:
+          type: string
+          enum: [PENDING, EXTRACTING, PROCESSING, READY, FAILED]
+
+  # ─────────────────────────────────────────
+  # Headers reutilizables
+  # ─────────────────────────────────────────
+  headers:
+    X-Correlation-ID:
+      description: >
+        Identificador único de la petición. Generado por el controller si el
+        cliente no lo envía. Propagado a todos los upstreams.
+      schema:
+        type: string
+        format: uuid
+    X-RateLimit-Limit:
+      description: Límite de peticiones configurado para el endpoint en la ventana actual.
+      schema:
+        type: integer
+    X-RateLimit-Remaining:
+      description: Peticiones restantes en la ventana actual.
+      schema:
+        type: integer
+    Retry-After:
+      description: Segundos hasta que se resetea la ventana de rate limiting.
+      schema:
+        type: integer
+
+  # ─────────────────────────────────────────
+  # Respuestas reutilizables
+  # ─────────────────────────────────────────
+  responses:
+
+    Unauthorized:
+      description: Falta o es inválido el header de autenticación.
+      headers:
+        X-Correlation-ID:
+          $ref: "#/components/headers/X-Correlation-ID"
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetail"
+
+    Forbidden:
+      description: El usuario autenticado no tiene acceso al recurso.
+      headers:
+        X-Correlation-ID:
+          $ref: "#/components/headers/X-Correlation-ID"
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetail"
+
+    NotFound:
+      description: Recurso no encontrado.
+      headers:
+        X-Correlation-ID:
+          $ref: "#/components/headers/X-Correlation-ID"
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetail"
+
+    TooManyRequests:
+      description: >
+        Límite de peticiones superado. Ver headers X-RateLimit-* y Retry-After.
+      headers:
+        X-Correlation-ID:
+          $ref: "#/components/headers/X-Correlation-ID"
+        X-RateLimit-Limit:
+          $ref: "#/components/headers/X-RateLimit-Limit"
+        X-RateLimit-Remaining:
+          $ref: "#/components/headers/X-RateLimit-Remaining"
+        Retry-After:
+          $ref: "#/components/headers/Retry-After"
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetail"
+          example:
+            type: "https://notebookum.example/errors/rate-limit-exceeded"
+            title: "Too Many Requests"
+            status: 429
+            detail: "Upload rate limit of 10 requests/minute exceeded."
+            instance: "/api/v1/documento/upload?requestId=xyz"
+
+    ServiceUnavailable:
+      description: >
+        Upstream no disponible, circuit breaker abierto, o bulkhead saturado.
+      headers:
+        X-Correlation-ID:
+          $ref: "#/components/headers/X-Correlation-ID"
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetail"
+
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      description: >
+        Token de autenticación. El controller extrae el user_id del header
+        Authorization y lo propaga como X-User-ID a los upstreams.
+
+# ─────────────────────────────────────────
+# Paths
+# ─────────────────────────────────────────
+paths:
+
+  # ── Operacionales (sin autenticación, sin routing a upstream) ──────────────
+
+  /health:
+    get:
+      operationId: liveness
+      summary: Liveness check
+      description: >
+        Devuelve 200 si el proceso está vivo. No verifica upstreams.
+        Usado por Kubernetes liveness probe y Traefik.
+      tags: [operational]
+      responses:
+        "200":
+          description: Proceso vivo.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum: [ok]
+                  service:
+                    type: string
+              example:
+                status: "ok"
+                service: "controller-notebookum"
+
+  /ready:
+    get:
+      operationId: readiness
+      summary: Readiness check
+      description: >
+        Devuelve 200 si todos los upstreams críticos responden.
+        Devuelve 503 con detalle por upstream si alguno falla.
+        Usado por Kubernetes readiness probe y dashboards.
+      tags: [operational]
+      responses:
+        "200":
+          description: Todos los upstreams responden correctamente.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum: [ready]
+                  upstreams:
+                    $ref: "#/components/schemas/UpstreamStatus"
+        "503":
+          description: Uno o más upstreams no responden.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum: [degraded]
+                  upstreams:
+                    $ref: "#/components/schemas/UpstreamStatus"
+
+  /status/circuits:
+    get:
+      operationId: circuitStatus
+      summary: Estado de los Circuit Breakers
+      description: >
+        Devuelve el estado actual (CLOSED/OPEN/HALF-OPEN) y el conteo de fallos
+        de cada Circuit Breaker por upstream. Usado por dashboards y Traefik
+        para detectar servicios degradados.
+      tags: [operational]
+      responses:
+        "200":
+          description: Array con estado de cada breaker.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/CircuitBreakerEntry"
+              example:
+                - service: "service-user"
+                  state: "closed"
+                  failureCount: 0
+                - service: "service-persistence"
+                  state: "closed"
+                  failureCount: 0
+                - service: "service-extractor"
+                  state: "open"
+                  failureCount: 5
+                - service: "service-ai"
+                  state: "half-open"
+                  failureCount: 3
+                - service: "monolito"
+                  state: "closed"
+                  failureCount: 0
+
+  # ── Usuarios ───────────────────────────────────────────────────────────────
+
+  /users:
+    post:
+      operationId: createUser
+      summary: Crear usuario
+      description: >
+        Valida los datos en el borde y delega a service-user o monolito según
+        configuración Strangler. Tipo: command.
+      tags: [users]
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UserCreateRequest"
+      responses:
+        "201":
+          description: Usuario creado.
+          headers:
+            X-Correlation-ID:
+              $ref: "#/components/headers/X-Correlation-ID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UserResponse"
+        "400":
+          description: Datos de entrada inválidos.
+          headers:
+            X-Correlation-ID:
+              $ref: "#/components/headers/X-Correlation-ID"
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetail"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /users/{user_id}:
+    get:
+      operationId: getUser
+      summary: Obtener usuario por ID
+      description: >
+        Valida que el usuario autenticado accede a su propio recurso.
+        Delega a service-user o monolito. Tipo: query.
+      tags: [users]
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: user_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Datos del usuario.
+          headers:
+            X-Correlation-ID:
+              $ref: "#/components/headers/X-Correlation-ID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UserResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  # ── Documentos ────────────────────────────────────────────────────────────
+
+  /documento/upload:
+    post:
+      operationId: uploadDocument
+      summary: Cargar documento PDF
+      description: >
+        Valida en el borde (Content-Type application/pdf, tamaño ≤ 25MB),
+        verifica usuario, y delega al Saga Orchestrator que gestiona los steps
+        validate-file → enqueue-extraction → await-extraction →
+        enqueue-ai-processing → await-ai → persist-result.
+        Tipo: command. Límite: 10 req/min por usuario.
+      tags: [documents]
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: Archivo PDF. Máximo 25MB.
+      responses:
+        "202":
+          description: >
+            Upload aceptado. El procesamiento continúa de forma asíncrona.
+            Usar GET /documents/{id}/status para consultar el progreso.
+          headers:
+            X-Correlation-ID:
+              $ref: "#/components/headers/X-Correlation-ID"
+            X-RateLimit-Limit:
+              $ref: "#/components/headers/X-RateLimit-Limit"
+            X-RateLimit-Remaining:
+              $ref: "#/components/headers/X-RateLimit-Remaining"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DocumentUploadResponse"
+        "400":
+          description: Tipo de archivo incorrecto o tamaño excedido.
+          headers:
+            X-Correlation-ID:
+              $ref: "#/components/headers/X-Correlation-ID"
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetail"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "413":
+          description: Archivo supera el límite de 25MB.
+          headers:
+            X-Correlation-ID:
+              $ref: "#/components/headers/X-Correlation-ID"
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetail"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /documents/{document_id}:
+    get:
+      operationId: getDocument
+      summary: Obtener metadatos y estado de un documento
+      description: >
+        Devuelve metadatos y estado actual del documento (PENDING/EXTRACTING/
+        PROCESSING/READY/FAILED). Útil para polling del Saga.
+        Tipo: query → service-persistence-read.
+      tags: [documents]
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: document_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Metadatos del documento.
+          headers:
+            X-Correlation-ID:
+              $ref: "#/components/headers/X-Correlation-ID"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  document_id:
+                    type: string
+                    format: uuid
+                  status:
+                    type: string
+                    enum: [PENDING, EXTRACTING, PROCESSING, READY, FAILED]
+                  filename:
+                    type: string
+                  owner_id:
+                    type: string
+                    format: uuid
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  # ── Resúmenes ─────────────────────────────────────────────────────────────
+
+  /summaries/{document_id}:
+    get:
+      operationId: getSummary
+      summary: Obtener resumen de documento
+      description: >
+        Verifica propietario del documento y devuelve el resumen generado.
+        Si el documento aún está procesando, devuelve 202.
+        Tipo: query → service-persistence-read.
+      tags: [summaries]
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: document_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Resumen disponible.
+          headers:
+            X-Correlation-ID:
+              $ref: "#/components/headers/X-Correlation-ID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SummaryResponse"
+        "202":
+          description: Documento en procesamiento; resumen aún no disponible.
+          headers:
+            X-Correlation-ID:
+              $ref: "#/components/headers/X-Correlation-ID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SummaryResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+    post:
+      operationId: requestSummary
+      summary: Solicitar (re)generación de resumen
+      description: >
+        Solicita la generación o regeneración del resumen de un documento.
+        Tipo: command → Saga Orchestrator → service-persistence-write.
+        Límite: 30 req/min por usuario.
+      tags: [summaries]
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: document_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "202":
+          description: Solicitud de resumen aceptada.
+          headers:
+            X-Correlation-ID:
+              $ref: "#/components/headers/X-Correlation-ID"
+            X-RateLimit-Limit:
+              $ref: "#/components/headers/X-RateLimit-Limit"
+            X-RateLimit-Remaining:
+              $ref: "#/components/headers/X-RateLimit-Remaining"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  document_id:
+                    type: string
+                    format: uuid
+                  status:
+                    type: string
+                    enum: [PROCESSING]
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  # ── Historial ────────────────────────────────────────────────────────────
+
+  /history:
+    get:
+      operationId: getHistory
+      summary: Historial de documentos del usuario
+      description: >
+        Devuelve el historial de documentos del usuario autenticado.
+        Tipo: query → service-persistence-read.
+      tags: [documents]
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+        - name: per_page
+          in: query
+          schema:
+            type: integer
+            default: 20
+            maximum: 100
+      responses:
+        "200":
+          description: Lista de documentos del usuario.
+          headers:
+            X-Correlation-ID:
+              $ref: "#/components/headers/X-Correlation-ID"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        document_id:
+                          type: string
+                          format: uuid
+                        filename:
+                          type: string
+                        status:
+                          type: string
+                        created_at:
+                          type: string
+                          format: date-time
+                  total:
+                    type: integer
+                  page:
+                    type: integer
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+tags:
+  - name: operational
+    description: Endpoints operacionales (liveness, readiness, circuit breakers). No requieren autenticación. No rutean a upstreams.
+  - name: users
+    description: Gestión de usuarios. Ruteados a service-user o monolito vía Strangler.
+  - name: documents
+    description: Gestión de documentos PDF. Commands vía Saga Orchestrator; queries vía service-persistence-read.
+  - name: summaries
+    description: Gestión de resúmenes generados por IA. Commands vía service-persistence-write; queries vía service-persistence-read.
