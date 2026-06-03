@@ -7,10 +7,16 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"service-controller-notebookum/internal/transport/upstream"
 )
+
+// sanitizeUTF8 elimina caracteres nulos (0x00) que Postgres rechaza
+func sanitizeUTF8(s string) string {
+	return strings.ReplaceAll(s, "\x00", "")
+}
 
 type Document struct {
 	ID       string `json:"id"`
@@ -54,7 +60,7 @@ func (s *PersistenceService) SaveDocument(ctx context.Context, doc *Document, he
 		"filename":      doc.Filename,
 		"filePath":      "in-memory",
 		"status":        doc.Status,
-		"extractedText": doc.Text,
+		"extractedText": sanitizeUTF8(doc.Text),
 	}
 	payload, _ := json.Marshal(dto)
 
@@ -143,7 +149,7 @@ func (s *PersistenceService) SaveSummary(ctx context.Context, docID string, summ
 
 	dto := map[string]interface{}{
 		"documentId": docIdInt,
-		"content":    summary,
+		"content":    sanitizeUTF8(summary),
 		"modelUsed":  "llama-3.3-70b-versatile",
 	}
 	payload, _ := json.Marshal(dto)
