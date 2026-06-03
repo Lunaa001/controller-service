@@ -34,3 +34,17 @@ func RequireAuth() gin.HandlerFunc {
 		c.Next()
 	}
 }
+
+// OptionalAuth extrae el user_id si está presente, sino usa "anonymous".
+// No bloquea el request si no hay auth — útil para el dashboard.
+func OptionalAuth() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		userID := ExtractUserID(c)
+		if userID == "" {
+			userID = "anonymous"
+		}
+
+		c.Set("user_id", userID)
+		c.Next()
+	}
+}

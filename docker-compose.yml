@@ -1,123 +1,318 @@
-version: '3.9'
+# ============================================================================
+# NotebookUM - Docker Compose Unificado
+# Levanta TODO el ecosistema de microservicios
+# ============================================================================
 
 services:
-  # Redis para caché
-  redis:
-    image: redis:7-alpine
-    container_name: notebookum-redis
+
+  # ─── INFRAESTRUCTURA ──────────────────────────────────────────────────────
+
+  # Traefik Reverse Proxy + Dashboard
+  traefik:
+    image: traefik:3.6
+    container_name: notebookum-traefik
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
     ports:
-      - "6379:6379"
-    environment:
-      REDIS_PASSWORD: ${REDIS_PASSWORD:-notebookum_redis_pass}
-    command: redis-server --requirepass ${REDIS_PASSWORD:-notebookum_redis_pass}
+      - "80:80"
+      - "443:443"
+      - "8080:8080" # Traefik Dashboard
     volumes:
-      - redis-data:/data
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ../NotebookUM/dockers/traefik/config/traefik.yml:/etc/traefik/traefik.yml:ro
+      - ../NotebookUM/dockers/traefik/config/config.yml:/etc/traefik/config.yml:ro
+      - ../NotebookUM/dockers/traefik/certs:/etc/certs:ro
+    networks:
+      - notebookum-network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.traefik.rule=Host(`traefik.universidad.localhost`)"
+      - "traefik.http.routers.traefik.entryPoints=http"
+      - "traefik.http.routers.traefik.service=api@internal"
+
+  # PostgreSQL Database (shared)
+  postgres:
+    image: postgres:16-alpine
+    container_name: notebookum-postgres
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-notebookum}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-notebookum123}
+      POSTGRES_DB: ${POSTGRES_DB:-notebookum}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
     networks:
       - notebookum-network
     healthcheck:
-      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      test: [ "CMD-SHELL", "pg_isready -U notebookum" ]
       interval: 10s
       timeout: 5s
       retries: 5
 
-  # Controller (Go)
+  # ─── REDIS POR MICROSERVICIO ──────────────────────────────────────────────
+
+  redis-controller:
+    image: redis:7-alpine
+    container_name: notebookum-redis-controller
+    restart: unless-stopped
+    command: redis-server --maxmemory 128mb --maxmemory-policy allkeys-lru
+    networks:
+      - notebookum-network
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis-user:
+    image: redis:7-alpine
+    container_name: notebookum-redis-user
+    restart: unless-stopped
+    command: redis-server --maxmemory 64mb --maxmemory-policy allkeys-lru
+    networks:
+      - notebookum-network
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis-extract:
+    image: redis:7-alpine
+    container_name: notebookum-redis-extract
+    restart: unless-stopped
+    command: redis-server --maxmemory 128mb --maxmemory-policy allkeys-lru
+    networks:
+      - notebookum-network
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis-summary:
+    image: redis:7-alpine
+    container_name: notebookum-redis-summary
+    restart: unless-stopped
+    command: redis-server --maxmemory 128mb --maxmemory-policy allkeys-lru
+    networks:
+      - notebookum-network
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis-persistence:
+    image: redis:7-alpine
+    container_name: notebookum-redis-persistence
+    restart: unless-stopped
+    command: redis-server --maxmemory 128mb --maxmemory-policy allkeys-lru
+    networks:
+      - notebookum-network
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─── MICROSERVICIOS ───────────────────────────────────────────────────────
+
+  # Controller (Go) — Gateway + Orchestrator — Puerto 5000
   controller:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: notebookum-controller
+    restart: unless-stopped
     ports:
       - "5000:5000"
     environment:
       PORT: "5000"
       X_CORRELATION_HEADER: "X-Correlation-ID"
       X_USER_ID_HEADER: "X-User-ID"
-      USER_SERVICE_URL: ${USER_SERVICE_URL:-http://user-service:8001}
-      EXTRACT_SERVICE_URL: ${EXTRACT_SERVICE_URL:-http://extract-service:8002}
-      SUMMARY_SERVICE_URL: ${SUMMARY_SERVICE_URL:-http://summary-service:8003}
-      PERSISTENCE_URL: ${PERSISTENCE_URL:-http://persistence-service:8004}
-      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
-      REDIS_PASSWORD: ${REDIS_PASSWORD:-notebookum_redis_pass}
+      USER_SERVICE_URL: "http://user-service:8001"
+      EXTRACT_SERVICE_URL: "http://extract-service:8002"
+      SUMMARY_SERVICE_URL: "http://summary-service:8003"
+      PERSISTENCE_URL: "http://persistence-service:8004"
+      REDIS_URL: "redis://redis-controller:6379"
+      REDIS_PASSWORD: ""
       REQUEST_TIMEOUT: "30"
     depends_on:
-      redis:
+      redis-controller:
         condition: service_healthy
     networks:
       - notebookum-network
     healthcheck:
-      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:5000/health"]
+      test: [ "CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:5000/health" ]
       interval: 10s
       timeout: 5s
       retries: 5
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.controller.rule=Host(`controller.universidad.localhost`)"
+      - "traefik.http.routers.controller.entryPoints=http"
+      - "traefik.http.services.controller.loadbalancer.server.port=5000"
 
-  # Placeholders para los otros servicios (para fines de documentación)
-  # En producción, estos estarían en repositorios separados
+  # User Service (Python/FastAPI) — Puerto 8001
+  user-service:
+    build:
+      context: ../user-service
+      dockerfile: Dockerfile
+    container_name: notebookum-user-service
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "8001"
+      DEBUG: "False"
+      JWT_SECRET_KEY: "${JWT_SECRET_KEY:-your-super-secret-key-change-in-production}"
+      JWT_ALGORITHM: "HS256"
+      JWT_EXPIRE_MINUTES: "30"
+      PERSISTENCE_SERVICE_URL: "http://persistence-service:8004"
+      REQUEST_TIMEOUT: "30"
+      REDIS_HOST: "redis-user"
+      REDIS_PORT: "6379"
+      LOG_LEVEL: "INFO"
+    depends_on:
+      redis-user:
+        condition: service_healthy
+      persistence-service:
+        condition: service_healthy
+    networks:
+      - notebookum-network
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8001/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.user-service.rule=Host(`user.universidad.localhost`)"
+      - "traefik.http.routers.user-service.entryPoints=http"
+      - "traefik.http.services.user-service.loadbalancer.server.port=8001"
 
-  # User Service (Python) - a ser desarrollado por otro equipo
-  # user-service:
-  #   build: ../user-service
-  #   container_name: notebookum-user-service
-  #   ports:
-  #     - "8001:8001"
-  #   environment:
-  #     PORT: "8001"
-  #   networks:
-  #     - notebookum-network
+  # Extract Service (Python/FastAPI) — Puerto 8002
+  extract-service:
+    build:
+      context: ../extract-service
+      dockerfile: Dockerfile
+    container_name: notebookum-extract-service
+    restart: unless-stopped
+    ports:
+      - "8002:8002"
+    environment:
+      REDIS_HOST: "redis-extract"
+      REDIS_PORT: "6379"
+    depends_on:
+      redis-extract:
+        condition: service_healthy
+    networks:
+      - notebookum-network
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8002/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.extract-service.rule=Host(`extract.universidad.localhost`)"
+      - "traefik.http.routers.extract-service.entryPoints=http"
+      - "traefik.http.services.extract-service.loadbalancer.server.port=8002"
 
-  # Extract Service (Python) - a ser desarrollado por otro equipo
-  # extract-service:
-  #   build: ../extract-service
-  #   container_name: notebookum-extract-service
-  #   ports:
-  #     - "8002:8002"
-  #   environment:
-  #     PORT: "8002"
-  #   networks:
-  #     - notebookum-network
+  # Summary Service (Python/FastAPI + Groq) — Puerto 8003
+  summary-service:
+    build:
+      context: ../Summary-service
+      dockerfile: Dockerfile
+    container_name: notebookum-summary-service
+    restart: unless-stopped
+    ports:
+      - "8003:8003"
+    environment:
+      DATABASE_URL: "postgresql://notebookum:notebookum123@postgres:5432/notebookum"
+      GROQ_API_KEY: "${GROQ_API_KEY}"
+      GROQ_MODEL: "${GROQ_MODEL:-llama-3.3-70b-versatile}"
+      HOST: "0.0.0.0"
+      PORT: "8003"
+      LOG_LEVEL: "INFO"
+      HEALTHCHECK_AI: "false"
+      REDIS_HOST: "redis-summary"
+      REDIS_PORT: "6379"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis-summary:
+        condition: service_healthy
+    networks:
+      - notebookum-network
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8003/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.summary-service.rule=Host(`summary.universidad.localhost`)"
+      - "traefik.http.routers.summary-service.entryPoints=http"
+      - "traefik.http.services.summary-service.loadbalancer.server.port=8003"
 
-  # Summary Service (Python) - a ser desarrollado por otro equipo
-  # summary-service:
-  #   build: ../summary-service
-  #   container_name: notebookum-summary-service
-  #   ports:
-  #     - "8003:8003"
-  #   environment:
-  #     PORT: "8003"
-  #   networks:
-  #     - notebookum-network
+  # Persistence Service (Java/Spring Boot) — Puerto 8004
+  persistence-service:
+    build:
+      context: ../persistence_service
+      dockerfile: Dockerfile
+    container_name: notebookum-persistence-service
+    restart: unless-stopped
+    ports:
+      - "8004:8004"
+    environment:
+      PORT: "8004"
+      DB_WRITE_HOST: "postgres"
+      DB_READ_HOST: "postgres"
+      DB_PORT: "5432"
+      DB_NAME: "notebookum"
+      DB_USER: "notebookum"
+      DB_PASSWORD: "notebookum123"
+      REDIS_HOST: "redis-persistence"
+      REDIS_PORT: "6379"
+      ALLOWED_ORIGINS: "*"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis-persistence:
+        condition: service_healthy
+    networks:
+      - notebookum-network
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8004/actuator/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.persistence-service.rule=Host(`persistence.universidad.localhost`)"
+      - "traefik.http.routers.persistence-service.entryPoints=http"
+      - "traefik.http.services.persistence-service.loadbalancer.server.port=8004"
+      # Circuit Breaker
+      - "traefik.http.middlewares.cb-persistence.circuitbreaker.expression=LatencyAtQuantileMS(50.0) > 100 || ResponseCodeRatio(500, 600, 0, 600) > 0.30"
+      # Bulkhead
+      - "traefik.http.middlewares.bulkhead-persistence.inflightreq.amount=10"
+      - "traefik.http.routers.persistence-service.middlewares=cb-persistence,bulkhead-persistence"
 
-  # Persistence Service (Java) - a ser desarrollado por otro equipo
-  # persistence-service:
-  #   build: ../persistence-service
-  #   container_name: notebookum-persistence-service
-  #   ports:
-  #     - "8004:8004"
-  #   environment:
-  #     PORT: "8004"
-  #     DATABASE_URL: "jdbc:postgresql://postgres:5432/notebookum"
-  #   depends_on:
-  #     - postgres
-  #   networks:
-  #     - notebookum-network
-
-  # Database (PostgreSQL)
-  # postgres:
-  #   image: postgres:16-alpine
-  #   container_name: notebookum-postgres
-  #   ports:
-  #     - "5432:5432"
-  #   environment:
-  #     POSTGRES_USER: ${POSTGRES_USER:-notebookum}
-  #     POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-notebookum_pass}
-  #     POSTGRES_DB: notebookum
-  #   volumes:
-  #     - postgres-data:/var/lib/postgresql/data
-  #   networks:
-  #     - notebookum-network
-
+# ─── VOLÚMENES ──────────────────────────────────────────────────────────────
 volumes:
-  redis-data:
+  postgres-data:
 
+    # ─── RED COMPARTIDA ─────────────────────────────────────────────────────────
 networks:
   notebookum-network:
     driver: bridge

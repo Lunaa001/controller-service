@@ -1,13 +1,10 @@
 package services
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
-	"strings"
 	"time"
 
 	"service-controller-notebookum/internal/transport/upstream"
