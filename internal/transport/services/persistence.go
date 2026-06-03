@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
+	"strconv"
 	"time"
 
 	"service-controller-notebookum/internal/transport/upstream"
@@ -29,33 +31,67 @@ func NewPersistenceService(baseURL string, timeout time.Duration) *PersistenceSe
 	}
 }
 
+// helper para asegurar JSON content type
+func (s *PersistenceService) request(method, path string, payload []byte, headers http.Header) (int, []byte, http.Header, error) {
+	if headers == nil {
+		headers = make(http.Header)
+	} else {
+		headers = headers.Clone()
+	}
+	headers.Set("Content-Type", "application/json")
+	return s.client.Request(method, path, payload, headers)
+}
+
 // SaveDocument guarda un documento con texto extraído
 func (s *PersistenceService) SaveDocument(ctx context.Context, doc *Document, headers http.Header) error {
-	payload, _ := json.Marshal(doc)
+	userIdInt, err := strconv.ParseInt(doc.UserID, 10, 64)
+	if err != nil || userIdInt <= 0 {
+		userIdInt = 1 // Fallback para "anonymous"
+	}
 
-	status, _, _, err := s.client.Request(http.MethodPost, "/api/v1/documents", payload, headers)
+	dto := map[string]interface{}{
+		"userId":        userIdInt,
+		"filename":      doc.Filename,
+		"filePath":      "in-memory",
+		"status":        doc.Status,
+		"extractedText": doc.Text,
+	}
+	payload, _ := json.Marshal(dto)
+
+	status, body, _, err := s.request(http.MethodPost, "/api/v1/db/documents", payload, headers)
 	if err != nil {
 		return err
 	}
 
 	if status != http.StatusCreated && status != http.StatusOK {
-		return errors.New("persistence service returned error")
+		return errors.New("persistence service returned error: status " + http.StatusText(status) + " body: " + string(body))
+	}
+
+	// Extraer el ID generado por la BD
+	var result map[string]interface{}
+	if err := json.Unmarshal(body, &result); err == nil {
+		if id, ok := result["id"].(float64); ok {
+			doc.ID = fmt.Sprintf("%.0f", id) // Actualizar ID en el doc para usarlo en SaveSummary
+		}
 	}
 
 	return nil
 }
 
-// UpdateDocument actualiza un documento (ej: agregar resumen)
+// UpdateDocument actualiza un documento
 func (s *PersistenceService) UpdateDocument(ctx context.Context, docID string, doc *Document, headers http.Header) error {
-	payload, _ := json.Marshal(doc)
+	dto := map[string]interface{}{
+		"status": doc.Status,
+	}
+	payload, _ := json.Marshal(dto)
 
-	status, _, _, err := s.client.Request(http.MethodPut, "/api/v1/documents/"+docID, payload, headers)
+	status, body, _, err := s.request(http.MethodPatch, "/api/v1/db/documents/"+docID, payload, headers)
 	if err != nil {
 		return err
 	}
 
 	if status != http.StatusOK && status != http.StatusNoContent {
-		return errors.New("persistence service returned error")
+		return errors.New("persistence service returned error: status " + http.StatusText(status) + " body: " + string(body))
 	}
 
 	return nil
@@ -63,7 +99,7 @@ func (s *PersistenceService) UpdateDocument(ctx context.Context, docID string, d
 
 // GetDocument obtiene un documento por ID
 func (s *PersistenceService) GetDocument(ctx context.Context, docID string, headers http.Header) (*Document, error) {
-	status, body, _, err := s.client.Request(http.MethodGet, "/api/v1/documents/"+docID, nil, headers)
+	status, body, _, err := s.request(http.MethodGet, "/api/v1/db/documents/"+docID, nil, headers)
 	if err != nil {
 		return nil, err
 	}
@@ -73,50 +109,52 @@ func (s *PersistenceService) GetDocument(ctx context.Context, docID string, head
 	}
 
 	if status != http.StatusOK {
-		return nil, errors.New("persistence service returned error")
+		return nil, errors.New("persistence service returned error: status " + http.StatusText(status) + " body: " + string(body))
 	}
 
-	var doc Document
-	if err := json.Unmarshal(body, &doc); err != nil {
+	var result map[string]interface{}
+	if err := json.Unmarshal(body, &result); err != nil {
 		return nil, err
 	}
 
-	return &doc, nil
-}
-
-// SaveExtractedText guarda texto extraído de un documento
-func (s *PersistenceService) SaveExtractedText(ctx context.Context, docID string, text string, headers http.Header) error {
-	payload, _ := json.Marshal(map[string]string{
-		"text":   text,
-		"status": "extracted",
-	})
-
-	status, _, _, err := s.client.Request(http.MethodPatch, "/api/v1/documents/"+docID+"/text", payload, headers)
-	if err != nil {
-		return err
+	doc := &Document{
+		ID: docID,
+	}
+	
+	if val, ok := result["filename"].(string); ok {
+		doc.Filename = val
+	}
+	if val, ok := result["status"].(string); ok {
+		doc.Status = val
+	}
+	if val, ok := result["extractedText"].(string); ok {
+		doc.Text = val
 	}
 
-	if status != http.StatusOK && status != http.StatusNoContent {
-		return errors.New("persistence service returned error")
-	}
-
-	return nil
+	return doc, nil
 }
 
 // SaveSummary guarda un resumen de un documento
 func (s *PersistenceService) SaveSummary(ctx context.Context, docID string, summary string, headers http.Header) error {
-	payload, _ := json.Marshal(map[string]string{
-		"summary": summary,
-		"status":  "ready",
-	})
+	docIdInt, err := strconv.Atoi(docID)
+	if err != nil {
+		return fmt.Errorf("invalid document ID for summary: %s", docID)
+	}
 
-	status, _, _, err := s.client.Request(http.MethodPatch, "/api/v1/documents/"+docID+"/summary", payload, headers)
+	dto := map[string]interface{}{
+		"documentId": docIdInt,
+		"content":    summary,
+		"modelUsed":  "llama-3.3-70b-versatile",
+	}
+	payload, _ := json.Marshal(dto)
+
+	status, body, _, err := s.request(http.MethodPost, "/api/v1/db/summaries", payload, headers)
 	if err != nil {
 		return err
 	}
 
-	if status != http.StatusOK && status != http.StatusNoContent {
-		return errors.New("persistence service returned error")
+	if status != http.StatusCreated && status != http.StatusOK {
+		return errors.New("persistence service returned error: status " + http.StatusText(status) + " body: " + string(body))
 	}
 
 	return nil

@@ -129,7 +129,7 @@ services:
     container_name: notebookum-controller
     restart: unless-stopped
     ports:
-      - "5000:5000"
+      - "5001:5000"
     environment:
       PORT: "5000"
       X_CORRELATION_HEADER: "X-Correlation-ID"
@@ -146,11 +146,6 @@ services:
         condition: service_healthy
     networks:
       - notebookum-network
-    healthcheck:
-      test: [ "CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:5000/health" ]
-      interval: 10s
-      timeout: 5s
-      retries: 5
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.controller.rule=Host(`controller.universidad.localhost`)"
@@ -186,7 +181,7 @@ services:
     networks:
       - notebookum-network
     healthcheck:
-      test: [ "CMD", "curl", "-f", "http://localhost:8001/health" ]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -215,7 +210,7 @@ services:
     networks:
       - notebookum-network
     healthcheck:
-      test: [ "CMD", "curl", "-f", "http://localhost:8002/health" ]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8002/health')"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -292,7 +287,7 @@ services:
     networks:
       - notebookum-network
     healthcheck:
-      test: [ "CMD", "curl", "-f", "http://localhost:8004/actuator/health" ]
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8004/actuator/health"]
       interval: 30s
       timeout: 10s
       retries: 5

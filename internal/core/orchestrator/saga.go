@@ -65,8 +65,10 @@ func (o *Orchestrator) ProcessDocument(
 	// Paso 1: Verificar cache primero
 	cacheKey := fmt.Sprintf("document:%s:%s", userID, documentID)
 	var cached DocumentProcessResult
-	if err := o.cache.Get(ctx, cacheKey, &cached); err == nil {
-		return &cached, nil
+	if o.cache != nil {
+		if err := o.cache.Get(ctx, cacheKey, &cached); err == nil {
+			return &cached, nil
+		}
 	}
 
 	// Paso 2: Extraer texto del PDF
@@ -103,7 +105,7 @@ func (o *Orchestrator) ProcessDocument(
 	}
 
 	// Paso 5: Guardar resumen en persistencia
-	if err := o.persistenceService.SaveSummary(ctx, documentID, summaryResp.Summary, headers); err != nil {
+	if err := o.persistenceService.SaveSummary(ctx, docToSave.ID, summaryResp.Summary, headers); err != nil {
 		return nil, fmt.Errorf("persistence summary save failed: %w", err)
 	}
 
@@ -116,10 +118,12 @@ func (o *Orchestrator) ProcessDocument(
 	}
 
 	// TTL de 24 horas
-	ttl := 24 * time.Hour
-	if err := o.cache.Set(ctx, cacheKey, result, ttl); err != nil {
-		// Log pero no falla el request
-		fmt.Printf("warning: failed to cache result: %v\n", err)
+	if o.cache != nil {
+		ttl := 24 * time.Hour
+		if err := o.cache.Set(ctx, cacheKey, result, ttl); err != nil {
+			// Log pero no falla el request
+			fmt.Printf("warning: failed to cache result: %v\n", err)
+		}
 	}
 
 	return result, nil
@@ -141,8 +145,10 @@ func (o *Orchestrator) GetDocument(
 	// Intentar obtener del cache
 	cacheKey := fmt.Sprintf("document:%s:%s", userID, documentID)
 	var cached DocumentProcessResult
-	if err := o.cache.Get(ctx, cacheKey, &cached); err == nil {
-		return &cached, nil
+	if o.cache != nil {
+		if err := o.cache.Get(ctx, cacheKey, &cached); err == nil {
+			return &cached, nil
+		}
 	}
 
 	// Si no está en cache, obtener de persistencia
@@ -159,8 +165,10 @@ func (o *Orchestrator) GetDocument(
 	}
 
 	// Cachear para futuras consultas
-	if err := o.cache.Set(ctx, cacheKey, result, 24*time.Hour); err != nil {
-		fmt.Printf("warning: failed to cache document: %v\n", err)
+	if o.cache != nil {
+		if err := o.cache.Set(ctx, cacheKey, result, 24*time.Hour); err != nil {
+			fmt.Printf("warning: failed to cache document: %v\n", err)
+		}
 	}
 
 	return result, nil
@@ -169,5 +177,8 @@ func (o *Orchestrator) GetDocument(
 // InvalidateDocumentCache invalida el cache de un documento
 func (o *Orchestrator) InvalidateDocumentCache(ctx context.Context, documentID string, userID string) error {
 	cacheKey := fmt.Sprintf("document:%s:%s", userID, documentID)
-	return o.cache.Delete(ctx, cacheKey)
+	if o.cache != nil {
+		return o.cache.Delete(ctx, cacheKey)
+	}
+	return nil
 }
