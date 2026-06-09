@@ -31,13 +31,28 @@ services:
       - "traefik.http.routers.traefik.entryPoints=http"
       - "traefik.http.routers.traefik.service=api@internal"
 
+  # HashiCorp Consul — Service Discovery
+  consul:
+    image: hashicorp/consul:1.16
+    container_name: notebookum-consul
+    restart: unless-stopped
+    ports:
+      - "8500:8500"   # Consul UI
+      - "8600:8600/udp" # DNS
+    command: agent -server -bootstrap-expect=1 -ui -client=0.0.0.0
+    networks:
+      - notebookum-network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.consul.rule=Host(`consul.universidad.localhost`)"
+      - "traefik.http.routers.consul.entryPoints=http"
+      - "traefik.http.services.consul.loadbalancer.server.port=8500"
+
   # PostgreSQL Database (shared)
   postgres:
     image: postgres:16-alpine
     container_name: notebookum-postgres
     restart: unless-stopped
-    ports:
-      - "5432:5432"
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-notebookum}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-notebookum123}
@@ -126,49 +141,59 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    image: notebookum-controller:v1.0.0
     container_name: notebookum-controller
     restart: unless-stopped
-    ports:
-      - "5001:5000"
+    deploy:
+      replicas: 1
+    networks:
+      notebookum-network:
+        aliases:
+          - api.universidad.localhost
     environment:
       PORT: "5000"
       X_CORRELATION_HEADER: "X-Correlation-ID"
       X_USER_ID_HEADER: "X-User-ID"
-      USER_SERVICE_URL: "http://user-service:8001"
-      EXTRACT_SERVICE_URL: "http://extract-service:8002"
-      SUMMARY_SERVICE_URL: "http://summary-service:8003"
-      PERSISTENCE_URL: "http://persistence-service:8004"
+      USER_SERVICE_URL: "http://users.universidad.localhost:5000"
+      EXTRACT_SERVICE_URL: "http://extractor.universidad.localhost:5000"
+      SUMMARY_SERVICE_URL: "http://ai.universidad.localhost:5000"
+      PERSISTENCE_URL: "http://persistence-java.universidad.localhost:8080"
       REDIS_URL: "redis://redis-controller:6379"
       REDIS_PASSWORD: ""
-      REQUEST_TIMEOUT: "30"
+      REQUEST_TIMEOUT: "60"
     depends_on:
       redis-controller:
         condition: service_healthy
-    networks:
-      - notebookum-network
     labels:
       - "traefik.enable=true"
-      - "traefik.http.routers.controller.rule=Host(`controller.universidad.localhost`)"
-      - "traefik.http.routers.controller.entryPoints=http"
+      - "traefik.http.routers.controller.rule=Host(`api.universidad.localhost`)"
+      - "traefik.http.routers.controller.entryPoints=https"
+      - "traefik.http.routers.controller.tls=true"
       - "traefik.http.services.controller.loadbalancer.server.port=5000"
+      - "traefik.http.middlewares.bulkhead-controller.inflightreq.amount=50"
+      - "traefik.http.routers.controller.middlewares=bulkhead-controller"
 
-  # User Service (Python/FastAPI) — Puerto 8001
+  # User Service (Python/FastAPI) — Puerto 5000
   user-service:
     build:
       context: ../user-service
       dockerfile: Dockerfile
-    container_name: notebookum-user-service
+    image: notebookum-user:v1.0.0
     restart: unless-stopped
-    ports:
-      - "8001:8001"
+    deploy:
+      replicas: 2
+    networks:
+      notebookum-network:
+        aliases:
+          - users.universidad.localhost
     environment:
       HOST: "0.0.0.0"
-      PORT: "8001"
+      PORT: "5000"
       DEBUG: "False"
       JWT_SECRET_KEY: "${JWT_SECRET_KEY:-your-super-secret-key-change-in-production}"
       JWT_ALGORITHM: "HS256"
       JWT_EXPIRE_MINUTES: "30"
-      PERSISTENCE_SERVICE_URL: "http://persistence-service:8004"
+      PERSISTENCE_SERVICE_URL: "http://persistence-java.universidad.localhost:8080"
       REQUEST_TIMEOUT: "30"
       REDIS_HOST: "redis-user"
       REDIS_PORT: "6379"
@@ -178,136 +203,174 @@ services:
         condition: service_healthy
       persistence-service:
         condition: service_healthy
-    networks:
-      - notebookum-network
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 10s
     labels:
       - "traefik.enable=true"
-      - "traefik.http.routers.user-service.rule=Host(`user.universidad.localhost`)"
-      - "traefik.http.routers.user-service.entryPoints=http"
-      - "traefik.http.services.user-service.loadbalancer.server.port=8001"
+      - "traefik.http.routers.user.rule=Host(`users.universidad.localhost`)"
+      - "traefik.http.routers.user.entryPoints=https"
+      - "traefik.http.routers.user.tls=true"
+      - "traefik.http.services.user.loadbalancer.server.port=5000"
+      - "traefik.http.routers.user.middlewares=user-cb,bulkhead-user,cors-user"
+      # CORS
+      - "traefik.http.middlewares.cors-user.headers.accesscontrolalloworiginlist=*"
+      - "traefik.http.middlewares.cors-user.headers.accesscontrolallowmethods=GET,POST,OPTIONS"
+      - "traefik.http.middlewares.cors-user.headers.accesscontrolallowheaders=Content-Type,Authorization"
+      - "traefik.http.middlewares.cors-user.headers.addvaryheader=true"
+      # Circuit Breaker
+      - "traefik.http.middlewares.user-cb.circuitbreaker.expression=LatencyAtQuantileMS(50.0) > 2000 || ResponseCodeRatio(500, 600, 0, 600) > 0.30 || NetworkErrorRatio() > 0.10"
+      # Bulkhead
+      - "traefik.http.middlewares.bulkhead-user.inflightreq.amount=10"
 
-  # Extract Service (Python/FastAPI) — Puerto 8002
+  # Extract Service (Python/FastAPI) — Puerto 5000
   extract-service:
     build:
       context: ../extract-service
       dockerfile: Dockerfile
+    image: notebookum-extractor:v1.0.0
     container_name: notebookum-extract-service
     restart: unless-stopped
-    ports:
-      - "8002:8002"
+    deploy:
+      replicas: 1
+    networks:
+      notebookum-network:
+        aliases:
+          - extractor.universidad.localhost
     environment:
       REDIS_HOST: "redis-extract"
       REDIS_PORT: "6379"
     depends_on:
       redis-extract:
         condition: service_healthy
-    networks:
-      - notebookum-network
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8002/health')"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 10s
     labels:
       - "traefik.enable=true"
-      - "traefik.http.routers.extract-service.rule=Host(`extract.universidad.localhost`)"
-      - "traefik.http.routers.extract-service.entryPoints=http"
-      - "traefik.http.services.extract-service.loadbalancer.server.port=8002"
+      - "traefik.http.routers.extractor.rule=Host(`extractor.universidad.localhost`)"
+      - "traefik.http.routers.extractor.entryPoints=https"
+      - "traefik.http.routers.extractor.tls=true"
+      - "traefik.http.routers.extractor.middlewares=extractor-cb,bulkhead-extractor,cors-extractor"
+      # CORS
+      - "traefik.http.middlewares.cors-extractor.headers.accesscontrolalloworiginlist=*"
+      - "traefik.http.middlewares.cors-extractor.headers.accesscontrolallowmethods=GET,POST,OPTIONS"
+      - "traefik.http.middlewares.cors-extractor.headers.accesscontrolallowheaders=Content-Type,Authorization"
+      - "traefik.http.middlewares.cors-extractor.headers.addvaryheader=true"
+      - "traefik.http.services.extractor.loadbalancer.server.port=5000"
+      # Circuit Breaker
+      - "traefik.http.middlewares.extractor-cb.circuitbreaker.expression=NetworkErrorRatio() > 0.5"
+      # Bulkhead
+      - "traefik.http.middlewares.bulkhead-extractor.inflightreq.amount=20"
 
-  # Summary Service (Python/FastAPI + Groq) — Puerto 8003
+  # Summary/AI Service (Python/FastAPI + Groq) — Puerto 5000
   summary-service:
     build:
       context: ../Summary-service
       dockerfile: Dockerfile
-    container_name: notebookum-summary-service
+    image: notebookum-ai:v1.0.0
     restart: unless-stopped
-    ports:
-      - "8003:8003"
+    deploy:
+      replicas: 2
+    networks:
+      notebookum-network:
+        aliases:
+          - ai.universidad.localhost
     environment:
-      DATABASE_URL: "postgresql://notebookum:notebookum123@postgres:5432/notebookum"
       GROQ_API_KEY: "${GROQ_API_KEY}"
       GROQ_MODEL: "${GROQ_MODEL:-llama-3.3-70b-versatile}"
       HOST: "0.0.0.0"
-      PORT: "8003"
+      PORT: "5000"
       LOG_LEVEL: "INFO"
       HEALTHCHECK_AI: "false"
       REDIS_HOST: "redis-summary"
       REDIS_PORT: "6379"
     depends_on:
-      postgres:
-        condition: service_healthy
       redis-summary:
         condition: service_healthy
-    networks:
-      - notebookum-network
     healthcheck:
-      test: [ "CMD", "curl", "-f", "http://localhost:8003/health" ]
+      test: [ "CMD", "curl", "-f", "http://localhost:5000/health" ]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 10s
     labels:
       - "traefik.enable=true"
-      - "traefik.http.routers.summary-service.rule=Host(`summary.universidad.localhost`)"
-      - "traefik.http.routers.summary-service.entryPoints=http"
-      - "traefik.http.services.summary-service.loadbalancer.server.port=8003"
+      - "traefik.http.routers.ai.rule=Host(`ai.universidad.localhost`)"
+      - "traefik.http.routers.ai.entryPoints=https"
+      - "traefik.http.routers.ai.tls=true"
+      - "traefik.http.routers.ai.middlewares=cors-ai"
+      # CORS
+      - "traefik.http.middlewares.cors-ai.headers.accesscontrolalloworiginlist=*"
+      - "traefik.http.middlewares.cors-ai.headers.accesscontrolallowmethods=GET,POST,OPTIONS"
+      - "traefik.http.middlewares.cors-ai.headers.accesscontrolallowheaders=Content-Type,Authorization"
+      - "traefik.http.middlewares.cors-ai.headers.addvaryheader=true"
+      - "traefik.http.services.ai.loadbalancer.server.port=5000"
 
-  # Persistence Service (Java/Spring Boot) — Puerto 8004
+  # Persistence Service (Java/Spring Boot) — Puerto 8080
   persistence-service:
     build:
       context: ../persistence_service
       dockerfile: Dockerfile
-    container_name: notebookum-persistence-service
+    image: notebookum-persistence:v1.0.0
     restart: unless-stopped
-    ports:
-      - "8004:8004"
+    deploy:
+      replicas: 2
+    networks:
+      notebookum-network:
+        aliases:
+          - persistence-java.universidad.localhost
     environment:
-      PORT: "8004"
+      PORT: "8080"
       DB_WRITE_HOST: "postgres"
       DB_READ_HOST: "postgres"
       DB_PORT: "5432"
-      DB_NAME: "notebookum"
-      DB_USER: "notebookum"
-      DB_PASSWORD: "notebookum123"
+      DB_NAME: "${POSTGRES_DB:-notebookum}"
+      DB_USER: "${POSTGRES_USER:-notebookum}"
+      DB_PASSWORD: "${POSTGRES_PASSWORD:-notebookum123}"
       REDIS_HOST: "redis-persistence"
       REDIS_PORT: "6379"
       ALLOWED_ORIGINS: "*"
+      DDL_AUTO: "update"
     depends_on:
       postgres:
         condition: service_healthy
       redis-persistence:
         condition: service_healthy
-    networks:
-      - notebookum-network
     healthcheck:
-      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8004/actuator/health"]
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8080/actuator/health"]
       interval: 30s
       timeout: 10s
       retries: 5
       start_period: 30s
     labels:
       - "traefik.enable=true"
-      - "traefik.http.routers.persistence-service.rule=Host(`persistence.universidad.localhost`)"
-      - "traefik.http.routers.persistence-service.entryPoints=http"
-      - "traefik.http.services.persistence-service.loadbalancer.server.port=8004"
+      - "traefik.http.routers.persistence.rule=Host(`persistence-java.universidad.localhost`)"
+      - "traefik.http.routers.persistence.entryPoints=https"
+      - "traefik.http.routers.persistence.tls=true"
+      - "traefik.http.routers.persistence.middlewares=cb-persistence,bulkhead-persistence,cors-persistence"
+      # CORS
+      - "traefik.http.middlewares.cors-persistence.headers.accesscontrolalloworiginlist=*"
+      - "traefik.http.middlewares.cors-persistence.headers.accesscontrolallowmethods=GET,POST,OPTIONS"
+      - "traefik.http.middlewares.cors-persistence.headers.accesscontrolallowheaders=Content-Type,Authorization"
+      - "traefik.http.middlewares.cors-persistence.headers.addvaryheader=true"
+      - "traefik.http.services.persistence.loadbalancer.server.port=8080"
       # Circuit Breaker
-      - "traefik.http.middlewares.cb-persistence.circuitbreaker.expression=LatencyAtQuantileMS(50.0) > 100 || ResponseCodeRatio(500, 600, 0, 600) > 0.30"
+      - "traefik.http.middlewares.cb-persistence.circuitbreaker.expression=LatencyAtQuantileMS(50.0) > 2000 || ResponseCodeRatio(500, 600, 0, 600) > 0.30 || NetworkErrorRatio() > 0.10"
       # Bulkhead
       - "traefik.http.middlewares.bulkhead-persistence.inflightreq.amount=10"
-      - "traefik.http.routers.persistence-service.middlewares=cb-persistence,bulkhead-persistence"
 
 # ─── VOLÚMENES ──────────────────────────────────────────────────────────────
 volumes:
   postgres-data:
 
-    # ─── RED COMPARTIDA ─────────────────────────────────────────────────────────
+# ─── RED COMPARTIDA ─────────────────────────────────────────────────────────
 networks:
   notebookum-network:
     driver: bridge

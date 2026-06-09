@@ -11,8 +11,12 @@ import (
 )
 
 type SummaryResponse struct {
-	Summary string `json:"summary"`
-	Status  string `json:"status,omitempty"`
+	DocumentID string `json:"document_id,omitempty"`
+	Filename   string `json:"filename,omitempty"`
+	JobID      string `json:"job_id,omitempty"`
+	Summary    string `json:"summary"`
+	Modelo     string `json:"modelo,omitempty"`
+	Status     string `json:"status,omitempty"`
 }
 
 type SummaryService struct {
@@ -25,13 +29,14 @@ func NewSummaryService(baseURL string, timeout time.Duration) *SummaryService {
 	}
 }
 
-// Generate genera un resumen a partir de texto extraído
-func (s *SummaryService) Generate(ctx context.Context, text string, headers http.Header) (*SummaryResponse, error) {
-	// El Summary Service espera: {"documento_id": N, "texto": "...", "max_tokens": 300}
+// Generate genera un resumen a partir de texto extraído.
+// Envía document_id, filename y job_id para tracking.
+func (s *SummaryService) Generate(ctx context.Context, text string, documentID string, filename string, headers http.Header) (*SummaryResponse, error) {
 	payload, _ := json.Marshal(map[string]interface{}{
-		"documento_id": 1,
-		"texto":        sanitizeUTF8(text),
-		"max_tokens":   500,
+		"document_id": documentID,
+		"texto":       sanitizeUTF8(text),
+		"filename":    filename,
+		"max_tokens":  2048,
 	})
 
 	if headers == nil {
@@ -50,27 +55,16 @@ func (s *SummaryService) Generate(ctx context.Context, text string, headers http
 		return nil, errors.New("summary service returned error: status " + http.StatusText(status) + " body: " + string(body))
 	}
 
-	// La respuesta viene como: {"success": true, "data": {"resumen": "..."}, ...}
-	var raw map[string]interface{}
-	if err := json.Unmarshal(body, &raw); err != nil {
+	// Parse standardized response: {"document_id": "...", "summary": "...", ...}
+	var resp SummaryResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
 		return nil, err
 	}
 
-	// Extraer el resumen del campo data.resumen
-	summary := ""
-	if data, ok := raw["data"].(map[string]interface{}); ok {
-		if resumen, ok := data["resumen"].(string); ok {
-			summary = resumen
-		}
-	}
-
-	if summary == "" {
+	if resp.Summary == "" {
 		return nil, errors.New("no summary in response from summary service")
 	}
 
-	return &SummaryResponse{
-		Summary: summary,
-		Status:  "ready",
-	}, nil
+	resp.Status = "ready"
+	return &resp, nil
 }
-

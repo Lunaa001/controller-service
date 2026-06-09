@@ -23,13 +23,13 @@ func Load() Config {
 		Port:              env("PORT", "5000"),
 		CorrelationHeader: env("X_CORRELATION_HEADER", "X-Correlation-ID"),
 		UserIDHeader:      env("X_USER_ID_HEADER", "X-User-ID"),
-		UserServiceURL:    env("USER_SERVICE_URL", "http://localhost:8001"),
-		ExtractServiceURL: env("EXTRACT_SERVICE_URL", "http://localhost:8002"),
-		SummaryServiceURL: env("SUMMARY_SERVICE_URL", "http://localhost:8003"),
-		PersistenceURL:    env("PERSISTENCE_URL", "http://localhost:8004"),
-		RedisURL:          env("REDIS_URL", "redis://localhost:6379"),
+		UserServiceURL:    env("USER_SERVICE_URL", "http://users.universidad.localhost:5000"),
+		ExtractServiceURL: env("EXTRACT_SERVICE_URL", "http://extractor.universidad.localhost:5000"),
+		SummaryServiceURL: env("SUMMARY_SERVICE_URL", "http://ai.universidad.localhost:5000"),
+		PersistenceURL:    env("PERSISTENCE_URL", "http://persistence-java.universidad.localhost:8080"),
+		RedisURL:          env("REDIS_URL", "redis://redis-controller:6379"),
 		RedisPassword:     env("REDIS_PASSWORD", ""),
-		RequestTimeout:    envInt("REQUEST_TIMEOUT", 30),
+		RequestTimeout:    envInt("REQUEST_TIMEOUT", 60),
 	}
 }
 
@@ -49,4 +49,3 @@ func envInt(key string, fallback int) int {
 	}
 	return fallback
 }
-

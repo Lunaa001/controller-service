@@ -19,12 +19,13 @@ func sanitizeUTF8(s string) string {
 }
 
 type Document struct {
-	ID       string `json:"id"`
-	UserID   string `json:"user_id"`
-	Text     string `json:"text,omitempty"`
-	Summary  string `json:"summary,omitempty"`
-	Status   string `json:"status"`
-	Filename string `json:"filename,omitempty"`
+	ID          string `json:"id"`
+	UserID      string `json:"user_id"`
+	Text        string `json:"text,omitempty"`
+	Summary     string `json:"summary,omitempty"`
+	Status      string `json:"status"`
+	Filename    string `json:"filename,omitempty"`
+	ContentHash string `json:"content_hash,omitempty"`
 }
 
 type PersistenceService struct {
@@ -48,6 +49,75 @@ func (s *PersistenceService) request(method, path string, payload []byte, header
 	return s.client.Request(method, path, payload, headers)
 }
 
+// GetDocumentByHash busca un documento por su hash SHA-256.
+// Si lo encuentra, devuelve el documento con su resumen asociado.
+// Si no existe, devuelve nil sin error.
+func (s *PersistenceService) GetDocumentByHash(ctx context.Context, contentHash string, headers http.Header) (*Document, error) {
+	status, body, _, err := s.request(http.MethodGet, "/api/v1/db/documents/hash/"+contentHash, nil, headers)
+	if err != nil {
+		return nil, err
+	}
+
+	if status == http.StatusNotFound {
+		return nil, nil // No existe — no es error
+	}
+
+	if status != http.StatusOK {
+		return nil, errors.New("persistence service returned error: status " + http.StatusText(status) + " body: " + string(body))
+	}
+
+	var result map[string]interface{}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, err
+	}
+
+	doc := &Document{}
+	if id, ok := result["id"].(float64); ok {
+		doc.ID = fmt.Sprintf("%.0f", id)
+	}
+	if val, ok := result["filename"].(string); ok {
+		doc.Filename = val
+	}
+	if val, ok := result["status"].(string); ok {
+		doc.Status = val
+	}
+	if val, ok := result["extractedText"].(string); ok {
+		doc.Text = val
+	}
+	if val, ok := result["contentHash"].(string); ok {
+		doc.ContentHash = val
+	}
+
+	return doc, nil
+}
+
+// GetSummaryByDocumentID obtiene el resumen asociado a un documento por su ID
+func (s *PersistenceService) GetSummaryByDocumentID(ctx context.Context, docID string, headers http.Header) (string, error) {
+	status, body, _, err := s.request(http.MethodGet, "/api/v1/db/documents/"+docID+"/summary", nil, headers)
+	if err != nil {
+		return "", err
+	}
+
+	if status == http.StatusNotFound {
+		return "", nil
+	}
+
+	if status != http.StatusOK {
+		return "", errors.New("persistence service returned error: status " + http.StatusText(status) + " body: " + string(body))
+	}
+
+	var result map[string]interface{}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return "", err
+	}
+
+	if content, ok := result["content"].(string); ok {
+		return content, nil
+	}
+
+	return "", nil
+}
+
 // SaveDocument guarda un documento con texto extraído
 func (s *PersistenceService) SaveDocument(ctx context.Context, doc *Document, headers http.Header) error {
 	userIdInt, err := strconv.ParseInt(doc.UserID, 10, 64)
@@ -61,6 +131,7 @@ func (s *PersistenceService) SaveDocument(ctx context.Context, doc *Document, he
 		"filePath":      "in-memory",
 		"status":        doc.Status,
 		"extractedText": sanitizeUTF8(doc.Text),
+		"contentHash":   doc.ContentHash,
 	}
 	payload, _ := json.Marshal(dto)
 
