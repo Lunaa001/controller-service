@@ -25,28 +25,29 @@ services:
       - ../NotebookUM/dockers/traefik/certs:/etc/certs:ro
     networks:
       - notebookum-network
+    depends_on:
+      - consul
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.traefik.rule=Host(`traefik.universidad.localhost`)"
       - "traefik.http.routers.traefik.entryPoints=http"
       - "traefik.http.routers.traefik.service=api@internal"
 
-  # HashiCorp Consul — Service Discovery
+  # HashiCorp Consul — Service Discovery + KV Store
   consul:
-    image: hashicorp/consul:1.16
+    image: hashicorp/consul:1.20
     container_name: notebookum-consul
     restart: unless-stopped
+    volumes:
+      - "../NotebookUM/dockers/consul/data:/consul/data"
+      - "../NotebookUM/dockers/consul/config:/consul/config"
+    command: agent -server -client=0.0.0.0 -bootstrap -ui -data-dir=/consul/data -config-dir=/consul/config -bootstrap-expect=1
     ports:
       - "8500:8500"   # Consul UI
+      - "8600:8600/tcp"
       - "8600:8600/udp" # DNS
-    command: agent -server -bootstrap-expect=1 -ui -client=0.0.0.0
     networks:
       - notebookum-network
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.consul.rule=Host(`consul.universidad.localhost`)"
-      - "traefik.http.routers.consul.entryPoints=http"
-      - "traefik.http.services.consul.loadbalancer.server.port=8500"
 
   # PostgreSQL Database (shared)
   postgres:
@@ -135,6 +136,9 @@ services:
       retries: 5
 
   # ─── MICROSERVICIOS ───────────────────────────────────────────────────────
+  # Nota: Los labels de Traefik fueron eliminados.
+  # Cada servicio se registra en Consul al arrancar y Traefik
+  # los descubre automáticamente via Consul Catalog Provider.
 
   # Controller (Go) — Gateway + Orchestrator — Puerto 5000
   controller:
@@ -161,17 +165,14 @@ services:
       REDIS_URL: "redis://redis-controller:6379"
       REDIS_PASSWORD: ""
       REQUEST_TIMEOUT: "60"
+      # Consul Service Discovery
+      CONSUL_HOST: "consul"
+      CONSUL_PORT: "8500"
     depends_on:
+      consul:
+        condition: service_started
       redis-controller:
         condition: service_healthy
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.controller.rule=Host(`api.universidad.localhost`)"
-      - "traefik.http.routers.controller.entryPoints=https"
-      - "traefik.http.routers.controller.tls=true"
-      - "traefik.http.services.controller.loadbalancer.server.port=5000"
-      - "traefik.http.middlewares.bulkhead-controller.inflightreq.amount=50"
-      - "traefik.http.routers.controller.middlewares=bulkhead-controller"
 
   # User Service (Python/FastAPI) — Puerto 5000
   user-service:
@@ -198,7 +199,12 @@ services:
       REDIS_HOST: "redis-user"
       REDIS_PORT: "6379"
       LOG_LEVEL: "INFO"
+      # Consul Service Discovery
+      CONSUL_HOST: "consul"
+      CONSUL_PORT: "8500"
     depends_on:
+      consul:
+        condition: service_started
       redis-user:
         condition: service_healthy
       persistence-service:
@@ -209,22 +215,6 @@ services:
       timeout: 10s
       retries: 3
       start_period: 10s
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.user.rule=Host(`users.universidad.localhost`)"
-      - "traefik.http.routers.user.entryPoints=https"
-      - "traefik.http.routers.user.tls=true"
-      - "traefik.http.services.user.loadbalancer.server.port=5000"
-      - "traefik.http.routers.user.middlewares=user-cb,bulkhead-user,cors-user"
-      # CORS
-      - "traefik.http.middlewares.cors-user.headers.accesscontrolalloworiginlist=*"
-      - "traefik.http.middlewares.cors-user.headers.accesscontrolallowmethods=GET,POST,OPTIONS"
-      - "traefik.http.middlewares.cors-user.headers.accesscontrolallowheaders=Content-Type,Authorization"
-      - "traefik.http.middlewares.cors-user.headers.addvaryheader=true"
-      # Circuit Breaker
-      - "traefik.http.middlewares.user-cb.circuitbreaker.expression=LatencyAtQuantileMS(50.0) > 2000 || ResponseCodeRatio(500, 600, 0, 600) > 0.30 || NetworkErrorRatio() > 0.10"
-      # Bulkhead
-      - "traefik.http.middlewares.bulkhead-user.inflightreq.amount=10"
 
   # Extract Service (Python/FastAPI) — Puerto 5000
   extract-service:
@@ -243,7 +233,12 @@ services:
     environment:
       REDIS_HOST: "redis-extract"
       REDIS_PORT: "6379"
+      # Consul Service Discovery
+      CONSUL_HOST: "consul"
+      CONSUL_PORT: "8500"
     depends_on:
+      consul:
+        condition: service_started
       redis-extract:
         condition: service_healthy
     healthcheck:
@@ -252,22 +247,6 @@ services:
       timeout: 10s
       retries: 3
       start_period: 10s
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.extractor.rule=Host(`extractor.universidad.localhost`)"
-      - "traefik.http.routers.extractor.entryPoints=https"
-      - "traefik.http.routers.extractor.tls=true"
-      - "traefik.http.routers.extractor.middlewares=extractor-cb,bulkhead-extractor,cors-extractor"
-      # CORS
-      - "traefik.http.middlewares.cors-extractor.headers.accesscontrolalloworiginlist=*"
-      - "traefik.http.middlewares.cors-extractor.headers.accesscontrolallowmethods=GET,POST,OPTIONS"
-      - "traefik.http.middlewares.cors-extractor.headers.accesscontrolallowheaders=Content-Type,Authorization"
-      - "traefik.http.middlewares.cors-extractor.headers.addvaryheader=true"
-      - "traefik.http.services.extractor.loadbalancer.server.port=5000"
-      # Circuit Breaker
-      - "traefik.http.middlewares.extractor-cb.circuitbreaker.expression=NetworkErrorRatio() > 0.5"
-      # Bulkhead
-      - "traefik.http.middlewares.bulkhead-extractor.inflightreq.amount=20"
 
   # Summary/AI Service (Python/FastAPI + Groq) — Puerto 5000
   summary-service:
@@ -291,7 +270,12 @@ services:
       HEALTHCHECK_AI: "false"
       REDIS_HOST: "redis-summary"
       REDIS_PORT: "6379"
+      # Consul Service Discovery
+      CONSUL_HOST: "consul"
+      CONSUL_PORT: "8500"
     depends_on:
+      consul:
+        condition: service_started
       redis-summary:
         condition: service_healthy
     healthcheck:
@@ -300,18 +284,6 @@ services:
       timeout: 10s
       retries: 3
       start_period: 10s
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.ai.rule=Host(`ai.universidad.localhost`)"
-      - "traefik.http.routers.ai.entryPoints=https"
-      - "traefik.http.routers.ai.tls=true"
-      - "traefik.http.routers.ai.middlewares=cors-ai"
-      # CORS
-      - "traefik.http.middlewares.cors-ai.headers.accesscontrolalloworiginlist=*"
-      - "traefik.http.middlewares.cors-ai.headers.accesscontrolallowmethods=GET,POST,OPTIONS"
-      - "traefik.http.middlewares.cors-ai.headers.accesscontrolallowheaders=Content-Type,Authorization"
-      - "traefik.http.middlewares.cors-ai.headers.addvaryheader=true"
-      - "traefik.http.services.ai.loadbalancer.server.port=5000"
 
   # Persistence Service (Java/Spring Boot) — Puerto 8080
   persistence-service:
@@ -338,7 +310,12 @@ services:
       REDIS_PORT: "6379"
       ALLOWED_ORIGINS: "*"
       DDL_AUTO: "update"
+      # Consul Service Discovery
+      CONSUL_HOST: "consul"
+      CONSUL_PORT: "8500"
     depends_on:
+      consul:
+        condition: service_started
       postgres:
         condition: service_healthy
       redis-persistence:
@@ -349,22 +326,6 @@ services:
       timeout: 10s
       retries: 5
       start_period: 30s
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.persistence.rule=Host(`persistence-java.universidad.localhost`)"
-      - "traefik.http.routers.persistence.entryPoints=https"
-      - "traefik.http.routers.persistence.tls=true"
-      - "traefik.http.routers.persistence.middlewares=cb-persistence,bulkhead-persistence,cors-persistence"
-      # CORS
-      - "traefik.http.middlewares.cors-persistence.headers.accesscontrolalloworiginlist=*"
-      - "traefik.http.middlewares.cors-persistence.headers.accesscontrolallowmethods=GET,POST,OPTIONS"
-      - "traefik.http.middlewares.cors-persistence.headers.accesscontrolallowheaders=Content-Type,Authorization"
-      - "traefik.http.middlewares.cors-persistence.headers.addvaryheader=true"
-      - "traefik.http.services.persistence.loadbalancer.server.port=8080"
-      # Circuit Breaker
-      - "traefik.http.middlewares.cb-persistence.circuitbreaker.expression=LatencyAtQuantileMS(50.0) > 2000 || ResponseCodeRatio(500, 600, 0, 600) > 0.30 || NetworkErrorRatio() > 0.10"
-      # Bulkhead
-      - "traefik.http.middlewares.bulkhead-persistence.inflightreq.amount=10"
 
 # ─── VOLÚMENES ──────────────────────────────────────────────────────────────
 volumes:

@@ -1,8 +1,14 @@
 package main
 
 import (
+	"context"
 	"log"
+	"net/http"
 	"os"
+	"os/signal"
+	"strconv"
+	"syscall"
+	"time"
 
 	"service-controller-notebookum/internal/config"
 	"service-controller-notebookum/internal/web"
@@ -12,9 +18,61 @@ func main() {
 	cfg := config.Load()
 	router := web.NewRouter(cfg)
 
-	addr := ":" + cfg.Port
-	if err := router.Run(addr); err != nil {
-		log.Printf("server stopped: %v", err)
-		os.Exit(1)
+	// ─── Consul Service Registration ────────────────────────────────────
+	consulCfg := config.LoadConsulConfig()
+	servicePort, _ := strconv.Atoi(cfg.Port)
+	if servicePort == 0 {
+		servicePort = 5000
 	}
+
+	if err := consulCfg.RegisterService(
+		"controller-service",
+		servicePort,
+		"/health",
+		[]string{
+			"traefik.enable=true",
+			"traefik.http.routers.controller-service.rule=Host(`api.universidad.localhost`)",
+			"traefik.http.routers.controller-service.entryPoints=http,https",
+			"traefik.http.services.controller-service.loadbalancer.server.port=" + cfg.Port,
+		},
+	); err != nil {
+		log.Printf("warning: consul registration failed: %v (service will still start)", err)
+	}
+
+	// ─── HTTP Server with Graceful Shutdown ──────────────────────────────
+	addr := ":" + cfg.Port
+	srv := &http.Server{
+		Addr:    addr,
+		Handler: router,
+	}
+
+	// Start server in a goroutine
+	go func() {
+		log.Printf("Controller service starting on %s", addr)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Printf("server error: %v", err)
+			os.Exit(1)
+		}
+	}()
+
+	// Wait for interrupt signal for graceful shutdown
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+
+	log.Println("Shutting down server...")
+
+	// Deregister from Consul
+	if err := consulCfg.DeregisterService("controller-service", servicePort); err != nil {
+		log.Printf("warning: consul deregistration failed: %v", err)
+	}
+
+	// Graceful shutdown with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Printf("server forced shutdown: %v", err)
+	}
+
+	log.Println("Server stopped")
 }
