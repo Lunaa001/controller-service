@@ -19,6 +19,7 @@ func main() {
 	router := web.NewRouter(cfg)
 
 	// ─── Consul Service Registration ────────────────────────────────────
+	// Tags are read from Consul KV automatically (no hardcoded labels)
 	consulCfg := config.LoadConsulConfig()
 	servicePort, _ := strconv.Atoi(cfg.Port)
 	if servicePort == 0 {
@@ -29,12 +30,7 @@ func main() {
 		"controller-service",
 		servicePort,
 		"/health",
-		[]string{
-			"traefik.enable=true",
-			"traefik.http.routers.controller-service.rule=Host(`api.universidad.localhost`)",
-			"traefik.http.routers.controller-service.entryPoints=http,https",
-			"traefik.http.services.controller-service.loadbalancer.server.port=" + cfg.Port,
-		},
+		nil, // tags fetched from Consul KV
 	); err != nil {
 		log.Printf("warning: consul registration failed: %v (service will still start)", err)
 	}

@@ -1,6 +1,10 @@
 # ============================================================================
 # NotebookUM - Docker Compose Unificado
 # Levanta TODO el ecosistema de microservicios
+#
+# Configuración centralizada en Consul KV Store.
+# Cada microservicio solo necesita CONSUL_HOST, CONSUL_PORT y CONSUL_TOKEN.
+# Ejecutar seed-kv.sh DESPUÉS de levantar Consul para cargar la configuración.
 # ============================================================================
 
 services:
@@ -40,8 +44,12 @@ services:
     restart: unless-stopped
     volumes:
       - "../NotebookUM/dockers/consul/data:/consul/data"
-      - "../NotebookUM/dockers/consul/config:/consul/config"
-    command: agent -server -client=0.0.0.0 -bootstrap -ui -data-dir=/consul/data -config-dir=/consul/config -bootstrap-expect=1
+    command: >
+      agent -server -client=0.0.0.0 -bootstrap -ui
+      -data-dir=/consul/data
+      -bootstrap-expect=1
+      -datacenter=dc-converter
+      -node=ds
     ports:
       - "8500:8500"   # Consul UI
       - "8600:8600/tcp"
@@ -55,9 +63,9 @@ services:
     container_name: notebookum-postgres
     restart: unless-stopped
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-notebookum}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-notebookum123}
-      POSTGRES_DB: ${POSTGRES_DB:-notebookum}
+      POSTGRES_USER: notebookum
+      POSTGRES_PASSWORD: notebookum123
+      POSTGRES_DB: notebookum
     volumes:
       - postgres-data:/var/lib/postgresql/data
     networks:
@@ -136,9 +144,9 @@ services:
       retries: 5
 
   # ─── MICROSERVICIOS ───────────────────────────────────────────────────────
-  # Nota: Los labels de Traefik fueron eliminados.
-  # Cada servicio se registra en Consul al arrancar y Traefik
-  # los descubre automáticamente via Consul Catalog Provider.
+  # Configuración centralizada en Consul KV Store.
+  # Solo se pasan CONSUL_HOST, CONSUL_PORT y CONSUL_TOKEN.
+  # Cada servicio lee su config y tags de Traefik desde Consul KV al arrancar.
 
   # Controller (Go) — Gateway + Orchestrator — Puerto 5000
   controller:
@@ -155,19 +163,9 @@ services:
         aliases:
           - api.universidad.localhost
     environment:
-      PORT: "5000"
-      X_CORRELATION_HEADER: "X-Correlation-ID"
-      X_USER_ID_HEADER: "X-User-ID"
-      USER_SERVICE_URL: "http://users.universidad.localhost:5000"
-      EXTRACT_SERVICE_URL: "http://extractor.universidad.localhost:5000"
-      SUMMARY_SERVICE_URL: "http://ai.universidad.localhost:5000"
-      PERSISTENCE_URL: "http://persistence-java.universidad.localhost:8080"
-      REDIS_URL: "redis://redis-controller:6379"
-      REDIS_PASSWORD: ""
-      REQUEST_TIMEOUT: "60"
-      # Consul Service Discovery
       CONSUL_HOST: "consul"
       CONSUL_PORT: "8500"
+      CONSUL_TOKEN: "2be22662-4819-4a0c-81d9-b3f50c4c389c"
     depends_on:
       consul:
         condition: service_started
@@ -188,20 +186,9 @@ services:
         aliases:
           - users.universidad.localhost
     environment:
-      HOST: "0.0.0.0"
-      PORT: "5000"
-      DEBUG: "False"
-      JWT_SECRET_KEY: "${JWT_SECRET_KEY:-your-super-secret-key-change-in-production}"
-      JWT_ALGORITHM: "HS256"
-      JWT_EXPIRE_MINUTES: "30"
-      PERSISTENCE_SERVICE_URL: "http://persistence-java.universidad.localhost:8080"
-      REQUEST_TIMEOUT: "30"
-      REDIS_HOST: "redis-user"
-      REDIS_PORT: "6379"
-      LOG_LEVEL: "INFO"
-      # Consul Service Discovery
       CONSUL_HOST: "consul"
       CONSUL_PORT: "8500"
+      CONSUL_TOKEN: "2be22662-4819-4a0c-81d9-b3f50c4c389c"
     depends_on:
       consul:
         condition: service_started
@@ -231,11 +218,9 @@ services:
         aliases:
           - extractor.universidad.localhost
     environment:
-      REDIS_HOST: "redis-extract"
-      REDIS_PORT: "6379"
-      # Consul Service Discovery
       CONSUL_HOST: "consul"
       CONSUL_PORT: "8500"
+      CONSUL_TOKEN: "2be22662-4819-4a0c-81d9-b3f50c4c389c"
     depends_on:
       consul:
         condition: service_started
@@ -262,17 +247,9 @@ services:
         aliases:
           - ai.universidad.localhost
     environment:
-      GROQ_API_KEY: "${GROQ_API_KEY}"
-      GROQ_MODEL: "${GROQ_MODEL:-llama-3.3-70b-versatile}"
-      HOST: "0.0.0.0"
-      PORT: "5000"
-      LOG_LEVEL: "INFO"
-      HEALTHCHECK_AI: "false"
-      REDIS_HOST: "redis-summary"
-      REDIS_PORT: "6379"
-      # Consul Service Discovery
       CONSUL_HOST: "consul"
       CONSUL_PORT: "8500"
+      CONSUL_TOKEN: "2be22662-4819-4a0c-81d9-b3f50c4c389c"
     depends_on:
       consul:
         condition: service_started
@@ -299,20 +276,9 @@ services:
         aliases:
           - persistence-java.universidad.localhost
     environment:
-      PORT: "8080"
-      DB_WRITE_HOST: "postgres"
-      DB_READ_HOST: "postgres"
-      DB_PORT: "5432"
-      DB_NAME: "${POSTGRES_DB:-notebookum}"
-      DB_USER: "${POSTGRES_USER:-notebookum}"
-      DB_PASSWORD: "${POSTGRES_PASSWORD:-notebookum123}"
-      REDIS_HOST: "redis-persistence"
-      REDIS_PORT: "6379"
-      ALLOWED_ORIGINS: "*"
-      DDL_AUTO: "update"
-      # Consul Service Discovery
       CONSUL_HOST: "consul"
       CONSUL_PORT: "8500"
+      CONSUL_TOKEN: "2be22662-4819-4a0c-81d9-b3f50c4c389c"
     depends_on:
       consul:
         condition: service_started
