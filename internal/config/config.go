@@ -51,7 +51,7 @@ func Load() Config {
 		ExtractServiceURL: getVal("EXTRACT_SERVICE_URL", "http://extractor.universidad.localhost:5000"),
 		SummaryServiceURL: getVal("SUMMARY_SERVICE_URL", "http://ai.universidad.localhost:5000"),
 		PersistenceURL:    getVal("PERSISTENCE_URL", "http://persistence-java.universidad.localhost:8080"),
-		RedisURL:          getVal("REDIS_URL", "redis://redis-controller:6379"),
+		RedisURL:          getVal("REDIS_URL", "redis://redis:6379"),
 		RedisPassword:     getVal("REDIS_PASSWORD", ""),
 		RequestTimeout:    getIntVal("REQUEST_TIMEOUT", 60),
 	}

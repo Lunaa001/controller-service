@@ -43,8 +43,39 @@ type consulKVEntry struct {
 	Value string `json:"Value"` // base64 encoded
 }
 
-// LoadConsulConfig loads Consul settings from environment variables
+// LoadConsulConfig loads Consul settings from environment variables.
+// Supports both CONSUL_URL (e.g. "http://consul:8500") and CONSUL_HOST+CONSUL_PORT.
 func LoadConsulConfig() ConsulConfig {
+	// Try CONSUL_URL first (format: http://host:port)
+	if consulURL := os.Getenv("CONSUL_URL"); consulURL != "" {
+		// Strip protocol
+		stripped := consulURL
+		for _, prefix := range []string{"http://", "https://"} {
+			if len(stripped) > len(prefix) && stripped[:len(prefix)] == prefix {
+				stripped = stripped[len(prefix):]
+				break
+			}
+		}
+		host := stripped
+		port := 8500
+		// Split host:port
+		for i := len(stripped) - 1; i >= 0; i-- {
+			if stripped[i] == ':' {
+				host = stripped[:i]
+				if p, err := strconv.Atoi(stripped[i+1:]); err == nil {
+					port = p
+				}
+				break
+			}
+		}
+		return ConsulConfig{
+			Host:  host,
+			Port:  port,
+			Token: env("CONSUL_TOKEN", "2be22662-4819-4a0c-81d9-b3f50c4c389c"),
+		}
+	}
+
+	// Fallback to individual env vars
 	port, _ := strconv.Atoi(env("CONSUL_PORT", "8500"))
 	return ConsulConfig{
 		Host:  env("CONSUL_HOST", "consul"),
