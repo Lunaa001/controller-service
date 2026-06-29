@@ -9,6 +9,7 @@ services:
           - api.universidad.localhost
     environment:
       - CONSUL_URL=http://consul:8500
+      - CONSUL_TOKEN=${CONSUL_TOKEN:-}
 
 networks:
   notebookum-network:

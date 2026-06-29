@@ -12,6 +12,9 @@ FROM gcr.io/distroless/static-debian12
 
 COPY --from=build /out/controller /usr/local/bin/controller
 
-EXPOSE 5001
+EXPOSE 5000
+
+HEALTHCHECK --interval=15s --timeout=5s --start-period=5s --retries=3 \
+    CMD ["/usr/local/bin/controller", "healthcheck"]
 
 CMD ["/usr/local/bin/controller"]

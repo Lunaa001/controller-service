@@ -14,7 +14,32 @@ import (
 	"service-controller-notebookum/internal/web"
 )
 
+// runHealthCheck is invoked as `controller healthcheck` from the Dockerfile's
+// HEALTHCHECK instruction. The runtime image is gcr.io/distroless/static —
+// it has no shell, curl or wget, so the binary must check its own health.
+func runHealthCheck() {
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "5000"
+	}
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get("http://localhost:" + port + "/health")
+	if err != nil {
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		os.Exit(1)
+	}
+	os.Exit(0)
+}
+
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "healthcheck" {
+		runHealthCheck()
+		return
+	}
+
 	cfg := config.Load()
 	router := web.NewRouter(cfg)
 

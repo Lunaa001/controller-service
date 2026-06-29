@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -71,7 +72,7 @@ func LoadConsulConfig() ConsulConfig {
 		return ConsulConfig{
 			Host:  host,
 			Port:  port,
-			Token: env("CONSUL_TOKEN", "2be22662-4819-4a0c-81d9-b3f50c4c389c"),
+			Token: env("CONSUL_TOKEN", ""),
 		}
 	}
 
@@ -80,7 +81,7 @@ func LoadConsulConfig() ConsulConfig {
 	return ConsulConfig{
 		Host:  env("CONSUL_HOST", "consul"),
 		Port:  port,
-		Token: env("CONSUL_TOKEN", "2be22662-4819-4a0c-81d9-b3f50c4c389c"),
+		Token: env("CONSUL_TOKEN", ""),
 	}
 }
 
@@ -163,7 +164,23 @@ func (c ConsulConfig) FetchKVConfig(serviceName string) map[string]string {
 	return config
 }
 
-// FetchTraefikTags builds Traefik-compatible tags from Consul KV sub-keys
+// FetchTraefikTags builds Traefik-compatible tags from Consul KV sub-keys.
+//
+// Every leaf key under config/{serviceName}/traefik/** maps 1:1 to a Traefik
+// tag by replacing "/" with "." and prefixing with "traefik.". E.g.:
+//
+//	config/{serviceName}/traefik/enable                                   = true
+//	  -> traefik.enable=true
+//	config/{serviceName}/traefik/http/routers/{name}/rule                 = Host(`...`)
+//	  -> traefik.http.routers.{name}.rule=Host(`...`)
+//	config/{serviceName}/traefik/http/routers/{name}/middlewares          = rate-limit@file
+//	  -> traefik.http.routers.{name}.middlewares=rate-limit@file
+//	config/{serviceName}/traefik/http/services/{name}/loadbalancer/server/port = 5000
+//	  -> traefik.http.services.{name}.loadbalancer.server.port=5000
+//
+// This supports any Traefik tag without code changes — the KV tree under
+// config/{service}/traefik/ is the single source of truth, seeded by the
+// Consul KV seeder.
 func (c ConsulConfig) FetchTraefikTags(serviceName string) []string {
 	url := fmt.Sprintf("http://%s:%d/v1/kv/config/%s/traefik/?recurse", c.Host, c.Port, serviceName)
 	req, err := http.NewRequest("GET", url, nil)
@@ -190,47 +207,38 @@ func (c ConsulConfig) FetchTraefikTags(serviceName string) []string {
 	}
 
 	prefix := fmt.Sprintf("config/%s/traefik/", serviceName)
-	traefikKV := make(map[string]string)
+	var tags []string
 
 	for _, entry := range entries {
 		if entry.Value == "" {
-			continue
+			continue // folder entry, no value
 		}
 		relativeKey := entry.Key
 		if len(entry.Key) > len(prefix) {
 			relativeKey = entry.Key[len(prefix):]
+		} else {
+			continue
 		}
 		decoded, err := base64.StdEncoding.DecodeString(entry.Value)
 		if err != nil {
 			continue
 		}
-		traefikKV[relativeKey] = string(decoded)
+		tagName := "traefik." + strings.ReplaceAll(relativeKey, "/", ".")
+		tags = append(tags, fmt.Sprintf("%s=%s", tagName, string(decoded)))
 	}
 
-	if len(traefikKV) == 0 {
-		return nil
+	if len(tags) > 0 {
+		log.Printf("✓ Loaded %d Traefik tags from Consul KV for %s", len(tags), serviceName)
 	}
-
-	var tags []string
-	if v, ok := traefikKV["enable"]; ok {
-		tags = append(tags, fmt.Sprintf("traefik.enable=%s", v))
-	}
-	if v, ok := traefikKV["router_rule"]; ok {
-		tags = append(tags, fmt.Sprintf("traefik.http.routers.%s.rule=%s", serviceName, v))
-	}
-	if v, ok := traefikKV["entrypoints"]; ok {
-		tags = append(tags, fmt.Sprintf("traefik.http.routers.%s.entryPoints=%s", serviceName, v))
-	}
-	if v, ok := traefikKV["lb_port"]; ok {
-		tags = append(tags, fmt.Sprintf("traefik.http.services.%s.loadbalancer.server.port=%s", serviceName, v))
-	}
-
-	log.Printf("✓ Loaded %d Traefik tags from Consul KV for %s", len(tags), serviceName)
 	return tags
 }
 
 // RegisterService registers this service instance with Consul.
 // If tags is nil, they are fetched automatically from Consul KV.
+//
+// Retries with a fixed backoff because the Consul stack and this service's
+// stack are deployed as independent `docker compose` projects — there is no
+// cross-project `depends_on`, so Consul may not be ready yet on first try.
 func (c ConsulConfig) RegisterService(serviceName string, servicePort int, healthCheckPath string, tags []string) error {
 	// If no tags provided, fetch from Consul KV
 	if tags == nil {
@@ -263,26 +271,37 @@ func (c ConsulConfig) RegisterService(serviceName string, servicePort int, healt
 	}
 
 	reqURL := fmt.Sprintf("http://%s:%d/v1/agent/service/register", c.Host, c.Port)
-	req, err := http.NewRequest("PUT", reqURL, bytes.NewReader(body))
-	if err != nil {
-		return fmt.Errorf("failed to create consul request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Consul-Token", c.Token)
-
 	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("consul registration failed: %w", err)
-	}
-	defer resp.Body.Close()
 
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("consul registration returned status %d", resp.StatusCode)
-	}
+	const retries = 5
+	const delay = 2 * time.Second
+	var lastErr error
+	for attempt := 1; attempt <= retries; attempt++ {
+		req, err := http.NewRequest("PUT", reqURL, bytes.NewReader(body))
+		if err != nil {
+			return fmt.Errorf("failed to create consul request: %w", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Consul-Token", c.Token)
 
-	log.Printf("✓ Registered in Consul: %s (id=%s, addr=%s:%d, tags=%d)", serviceName, serviceID, containerIP, servicePort, len(tags))
-	return nil
+		resp, err := client.Do(req)
+		if err == nil {
+			defer resp.Body.Close()
+			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				log.Printf("✓ Registered in Consul: %s (id=%s, addr=%s:%d, tags=%d)", serviceName, serviceID, containerIP, servicePort, len(tags))
+				return nil
+			}
+			lastErr = fmt.Errorf("consul registration returned status %d", resp.StatusCode)
+		} else {
+			lastErr = fmt.Errorf("consul registration failed: %w", err)
+		}
+
+		if attempt < retries {
+			log.Printf("warning: consul registration attempt %d/%d failed for %s: %v, retrying in %s", attempt, retries, serviceName, lastErr, delay)
+			time.Sleep(delay)
+		}
+	}
+	return lastErr
 }
 
 // DeregisterService deregisters this service instance from Consul
